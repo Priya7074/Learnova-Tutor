@@ -72,11 +72,18 @@ function formatTimestamp(seconds: number): string {
 
   return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
-
+const youtubeCaptionCache = new Map<string, TranscriptSegment[]>();
+const MAX_CAPTION_CACHE_SIZE = 20;
 export async function fetchYouTubeCaptions(
   videoId: string
 ): Promise<TranscriptSegment[] | null> {
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) return null;
+  const cachedCaptions = youtubeCaptionCache.get(videoId);
+
+if (cachedCaptions) {
+  console.log(`Using cached YouTube captions: ${videoId}`);
+  return cachedCaptions;
+}
 
   try {
     console.log(`Connecting to YouTube Android client: ${videoId}`);
@@ -197,7 +204,17 @@ export async function fetchYouTubeCaptions(
 
     console.log('First caption sample:', segments[0]);
 
-    return segments;
+if (youtubeCaptionCache.size >= MAX_CAPTION_CACHE_SIZE) {
+  const oldestVideoId = youtubeCaptionCache.keys().next().value;
+
+  if (oldestVideoId) {
+    youtubeCaptionCache.delete(oldestVideoId);
+  }
+}
+
+youtubeCaptionCache.set(videoId, segments);
+
+return segments;
   } catch (error: any) {
     console.error(
       `YouTube caption fetch failed for ${videoId}:`,

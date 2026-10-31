@@ -6,7 +6,7 @@ import { performChronoScopedRag, formatSecondsToTime } from './ragEngine.js';
 import { verifyCode } from './codeVerifier.js';
 import { generateQuizFromVideo, generateQuizFromDocument, evaluateQuizAttempt, validateQuizAnswers } from './quizEngine.js';
 import { evaluateInterviewAnswer } from './interviewEngine.js';
-import { VideoItem, DocumentItem, User, Quiz } from '../types.js';
+import { VideoItem, DocumentItem, User, Quiz, QuizQuestion } from '../types.js';
 import { initDatabase, getDatabaseStatus, queryDb } from '../db/dbClient.js';
 import { extractYouTubeVideoId, fetchYouTubeCaptions } from '../utils/youtube.js';
 
@@ -123,7 +123,10 @@ async function persistQuiz(quiz: Quiz): Promise<void> {
       `INSERT INTO quiz_questions (id, quiz_id, question, options, correct_index, explanation, source_reference, max_timestamp_seconds)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
       [question.id, quiz.id, question.question, JSON.stringify(question.options), question.correctIndex, question.explanation,
-        question.sourceReference, question.maxTimestampSeconds ?? null],
+        question.sourceReference,
+question.maxTimestampSeconds != null
+  ? Math.floor(question.maxTimestampSeconds)
+  : null],
     );
   }
 }
@@ -637,38 +640,195 @@ Provide an intuitive, clear, step-by-step response for the student with exact ci
   }
 
   // 6. QUIZZES
+    // 6. QUIZZES
   if (url === '/api/quizzes/generate' && method === 'POST') {
     const { sourceType, sourceId, maxTimestampSeconds, difficulty } = body || {};
     const diff = difficulty || 'Medium';
+
     if (!['Easy', 'Medium', 'Hard'].includes(diff)) {
       return { status: 400, data: { error: 'Choose Easy, Medium, or Hard difficulty.' } };
     }
 
     let quiz: Quiz;
+
     if (sourceType === 'document' || sourceType === 'notes') {
       const doc = serverDocuments.find(d => d.id === sourceId);
-      if (!doc) return { status: 404, data: { error: 'The selected document was not found.' } };
+
+      if (!doc) {
+        return { status: 404, data: { error: 'The selected document was not found.' } };
+      }
+
       quiz = generateQuizFromDocument(doc, diff);
+
     } else if (sourceType === 'video') {
       const video = serverVideos.find(v => v.id === sourceId);
-      if (!video) return { status: 404, data: { error: 'The selected video was not found.' } };
+
+      if (!video) {
+        return { status: 404, data: { error: 'The selected video was not found.' } };
+      }
+
+      if (!geminiClient) {
+        return { status: 503, data: { error: 'AI quiz generation is not configured. Please check the Gemini API key.' } };
+      }
+
       const requestedLimit = Number(maxTimestampSeconds);
       const timeLimit = Number.isFinite(requestedLimit)
         ? Math.max(0, Math.min(Math.floor(requestedLimit), video.durationSeconds))
         : 0;
-      quiz = generateQuizFromVideo(video, timeLimit, diff);
+
+      // Strict timestamp scope: future transcript segments are never sent to Gemini.
+      const eligibleTranscripts = video.transcripts.filter(
+        segment => segment.start <= timeLimit
+      );
+
+      if (eligibleTranscripts.length === 0) {
+        return {
+          status: 400,
+          data: { error: 'No transcript content is available before the selected timestamp. Move the video forward and try again.' }
+        };
+      }
+
+      const transcriptText = eligibleTranscripts.map(segment =>
+        `SEGMENT_ID: ${segment.id}\nTIMESTAMP: ${segment.timestampFormatted}\nTEXT: ${segment.text}`
+      ).join('\n\n');
+
+      const prompt = `
+You are an educational quiz generator.
+
+Create 5 multiple-choice questions using ONLY the transcript provided below.
+
+VIDEO TITLE: ${video.title}
+DIFFICULTY: ${diff}
+MAXIMUM ALLOWED TIMESTAMP: ${timeLimit} seconds
+
+STRICT RULES:
+1. Use only facts explicitly supported by the supplied transcript.
+2. Do not use outside knowledge or invent facts.
+3. Do not use information from after the maximum allowed timestamp.
+4. Match the requested difficulty: Easy, Medium, or Hard.
+5. Each question must have exactly four distinct answer options.
+6. Exactly one option must be correct.
+7. Questions must use the language of the transcript where practical.
+8. Every question must cite one supplied SEGMENT_ID as its evidence.
+9. If the transcript does not contain enough information, return fewer questions rather than inventing them.
+
+Return ONLY valid JSON in this exact structure:
+{
+  "questions": [
+    {
+      "question": "Question text",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctIndex": 0,
+      "explanation": "Explanation supported by the transcript",
+      "sourceSegmentId": "EXACT_SEGMENT_ID"
+    }
+  ]
+}
+
+TRANSCRIPT:
+${transcriptText}
+`;
+
+      try {
+        const response = await geminiClient.models.generateContent({
+          model: 'gemini-3.5-flash-lite',
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json'
+          }
+        });
+
+        const rawText = response.text || '';
+        const parsed = JSON.parse(rawText);
+        const generatedQuestions = Array.isArray(parsed.questions)
+          ? parsed.questions
+          : [];
+
+        const segmentMap = new Map(
+          eligibleTranscripts.map(segment => [segment.id, segment])
+        );
+
+        const questions: QuizQuestion[] = generatedQuestions
+          .filter((item: any) => {
+            const segment = segmentMap.get(item.sourceSegmentId);
+
+            return (
+              segment &&
+              typeof item.question === 'string' &&
+              item.question.trim().length > 0 &&
+              Array.isArray(item.options) &&
+              item.options.length === 4 &&
+              item.options.every((option: unknown) =>
+                typeof option === 'string' && option.trim().length > 0
+              ) &&
+              Number.isInteger(item.correctIndex) &&
+              item.correctIndex >= 0 &&
+              item.correctIndex < 4 &&
+              typeof item.explanation === 'string'
+            );
+          })
+          .slice(0, 5)
+          .map((item: any, index: number) => {
+            const segment = segmentMap.get(item.sourceSegmentId)!;
+
+            return {
+              id: `q_video_${index + 1}`,
+              question: item.question.trim(),
+              options: item.options.map((option: string) => option.trim()),
+              correctIndex: item.correctIndex,
+              explanation: item.explanation.trim(),
+              sourceReference: `Video [${segment.timestampFormatted}]`,
+              maxTimestampSeconds: segment.start
+            };
+          });
+
+        if (questions.length === 0) {
+          return {
+            status: 400,
+            data: { error: 'AI could not generate valid questions from the available transcript. Try selecting a later timestamp.' }
+          };
+        }
+
+        const quizId = `quiz_vid_${video.id}_${Date.now()}`;
+
+        quiz = {
+          id: quizId,
+          title: `${video.title} (Timestamp Scope ≤ ${formatSecondsToTime(timeLimit)})`,
+          sourceType: 'video',
+          sourceTitle: video.title,
+          timestampLimitFormatted: formatSecondsToTime(timeLimit),
+          difficulty: diff,
+          questions: questions.map((question, index) => ({
+            ...question,
+            id: `${quizId}_q${index + 1}`
+          }))
+        };
+
+      } catch (error) {
+        console.error('AI video quiz generation failed:', error);
+
+        return {
+          status: 502,
+          data: { error: 'AI quiz generation failed. Please try again.' }
+        };
+      }
+
     } else {
       return { status: 400, data: { error: 'Choose a supported quiz source.' } };
     }
+
     if (!quiz.questions.length) {
-      return { status: 400, data: { error: 'No quiz questions are available for this video in the selected timestamp scope.' } };
+      return {
+        status: 400,
+        data: { error: 'No quiz questions could be generated from this source.' }
+      };
     }
 
     await persistQuiz(quiz);
     issuedQuizzes.set(quiz.id, quiz);
+
     return { status: 200, data: { quiz } };
   }
-
   if (url === '/api/quizzes/submit' && method === 'POST') {
     const { quizId, attemptId, userAnswers } = body || {};
     if (typeof quizId !== 'string' || typeof attemptId !== 'string' || !/^[\w-]{8,100}$/.test(attemptId)) {
