@@ -1,0 +1,8 @@
+{
+  "name": "Learnova Tutor",
+  "description": "Interactive AI-Powered Learning Assistant with Chrono-Scoped Video RAG, Document Q&A, Code Verification, Quizzes, and Mock Interviews.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

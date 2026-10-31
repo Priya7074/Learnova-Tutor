@@ -1,0 +1,208 @@
+import { VideoItem, DocumentItem, TranscriptSegment, DocumentChunk, SourceReference, ChatMessage } from '../types.js';
+
+export interface RagResult {
+  answer: string;
+  evidenceGrounded: boolean;
+  insufficientEvidence: boolean;
+  futureContentBlocked: boolean;
+  blockedExplanationTime?: string;
+  sources: SourceReference[];
+  eligibleTranscriptsCount: number;
+  totalTranscriptsCount: number;
+}
+
+export function formatSecondsToTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+export function parseTimeToSeconds(timeStr: string): number {
+  const parts = timeStr.trim().split(':').map(Number);
+  if (parts.length === 2) {
+    return parts[0] * 60 + parts[1];
+  } else if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  return 0;
+}
+
+function calculateTextSimilarity(query: string, text: string): number {
+  const queryTerms = query.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2);
+  const target = text.toLowerCase();
+  if (queryTerms.length === 0) return 0;
+  
+  let score = 0;
+  for (const term of queryTerms) {
+    if (target.includes(term)) {
+      score += 1;
+      // Bonus for exact word boundaries
+      const regex = new RegExp(`\\b${term}\\b`, 'i');
+      if (regex.test(target)) score += 1.5;
+    }
+  }
+  return score / queryTerms.length;
+}
+
+export function performChronoScopedRag(
+  question: string,
+  video?: VideoItem | null,
+  currentTimestampSeconds: number = 0,
+  documents: DocumentItem[] = []
+): RagResult {
+  const sources: SourceReference[] = [];
+  const qClean = question.trim();
+
+  // 1. Separate transcripts by current timestamp
+  let eligibleTranscripts: TranscriptSegment[] = [];
+  let futureTranscripts: TranscriptSegment[] = [];
+
+  if (video && video.transcripts && video.transcripts.length > 0) {
+    eligibleTranscripts = video.transcripts.filter(t => t.start <= currentTimestampSeconds);
+    futureTranscripts = video.transcripts.filter(t => t.start > currentTimestampSeconds);
+  }
+
+  // 2. Score eligible transcripts
+  const eligibleMatches: { transcript: TranscriptSegment; score: number }[] = [];
+  for (const t of eligibleTranscripts) {
+    const score = calculateTextSimilarity(qClean, `${t.title || ''} ${t.text}`);
+    if (score > 0.15) {
+      eligibleMatches.push({ transcript: t, score });
+    }
+  }
+  eligibleMatches.sort((a, b) => b.score - a.score);
+
+  // 3. Score future transcripts to identify if topic is coming up
+  const futureMatches: { transcript: TranscriptSegment; score: number }[] = [];
+  for (const t of futureTranscripts) {
+    const score = calculateTextSimilarity(qClean, `${t.title || ''} ${t.text}`);
+    if (score > 0.25) {
+      futureMatches.push({ transcript: t, score });
+    }
+  }
+  futureMatches.sort((a, b) => b.score - a.score);
+
+  // 4. Score document chunks
+  const documentMatches: { doc: DocumentItem; chunk: DocumentChunk; score: number }[] = [];
+  for (const doc of documents) {
+    for (const chunk of doc.chunks) {
+      const score = calculateTextSimilarity(qClean, `${chunk.title || ''} ${chunk.content}`);
+      if (score > 0.18) {
+        documentMatches.push({ doc, chunk, score });
+      }
+    }
+  }
+  documentMatches.sort((a, b) => b.score - a.score);
+
+  // 5. Evaluate Chrono-Scoped rule
+  const currentFormatted = formatSecondsToTime(currentTimestampSeconds);
+
+  // CASE A: Topic is prominently in future video transcripts, but NOT in eligible video transcripts (≤ currentTimestampSeconds)
+  if (futureMatches.length > 0 && eligibleMatches.length === 0) {
+    const futureTop = futureMatches[0].transcript;
+    const futureTimeFormatted = futureTop.timestampFormatted || formatSecondsToTime(futureTop.start);
+
+    // Strict Chrono-Scoped lock: Future lecture content is blocked to prevent spoilers and ensure sequential learning
+    return {
+      answer: `⏱️ **Chrono-Scoped RAG Notice: Topic Not Covered Yet**\n\n` +
+        `You asked: *"${qClean}"*\n\n` +
+        `At your current playback position (**${currentFormatted}**), this concept has **not yet been introduced** in the video lecture. ` +
+        `In accordance with Learnova's strict Chrono-Scoped RAG policy, future video transcript segments are locked to avoid confusion and prevent premature cognitive overload.\n\n` +
+        `🔍 **Lecture Timeline:**\n` +
+        `• Current Playback Position: **${currentFormatted}** (Unlocked segments: ${eligibleTranscripts.length}/${video?.transcripts.length || 0})\n` +
+        `• Future Topic Coverage: **${futureTimeFormatted}** ("*${futureTop.title}*")\n\n` +
+        `I could not find sufficient evidence in your available learning materials up to timestamp ${currentFormatted}. Please continue watching to timestamp **${futureTimeFormatted}** to unlock this explanation.`,
+      evidenceGrounded: false,
+      insufficientEvidence: true,
+      futureContentBlocked: true,
+      blockedExplanationTime: futureTimeFormatted,
+      sources: [],
+      eligibleTranscriptsCount: eligibleTranscripts.length,
+      totalTranscriptsCount: video ? video.transcripts.length : 0,
+    };
+  }
+
+  // CASE B: Supported by eligible video transcripts (and optionally documents)
+  if (eligibleMatches.length > 0) {
+    const topVideoMatch = eligibleMatches[0].transcript;
+    sources.push({
+      type: 'video',
+      title: video?.title || 'Video Lecture',
+      identifier: `Video [${topVideoMatch.timestampFormatted}]`,
+      timestampSeconds: topVideoMatch.start,
+      snippet: topVideoMatch.text.substring(0, 160) + '...',
+    });
+
+    if (documentMatches.length > 0) {
+      const topDoc = documentMatches[0];
+      const docLabel = topDoc.chunk.type === 'slide' ? `Slide ${topDoc.chunk.pageOrSlideNumber}` : `Page ${topDoc.chunk.pageOrSlideNumber}`;
+      sources.push({
+        type: topDoc.doc.type,
+        title: topDoc.doc.title,
+        identifier: `${topDoc.doc.title} [${docLabel}]`,
+        pageNumber: topDoc.chunk.pageOrSlideNumber,
+        snippet: topDoc.chunk.content.substring(0, 160) + '...',
+      });
+    }
+
+    let answerText = `Based strictly on the content covered up to timestamp **${currentFormatted}** in **${video?.title}**:\n\n`;
+    answerText += `📌 **Source: [Video ${topVideoMatch.timestampFormatted} - ${topVideoMatch.title}]**\n`;
+    answerText += `${topVideoMatch.text}\n\n`;
+
+    if (documentMatches.length > 0) {
+      const topDoc = documentMatches[0];
+      const docLabel = topDoc.chunk.type === 'slide' ? `Slide ${topDoc.chunk.pageOrSlideNumber}` : `Page ${topDoc.chunk.pageOrSlideNumber}`;
+      answerText += `📄 **Supplementary Reference [${topDoc.doc.title} - ${docLabel}]:**\n${topDoc.chunk.content}\n\n`;
+    }
+
+    answerText += `💡 **Key Takeaway:** Everything above has been verified against your unlocked learning timeline (≤ ${currentFormatted}).`;
+
+    return {
+      answer: answerText,
+      evidenceGrounded: true,
+      insufficientEvidence: false,
+      futureContentBlocked: false,
+      sources,
+      eligibleTranscriptsCount: eligibleTranscripts.length,
+      totalTranscriptsCount: video ? video.transcripts.length : 0,
+    };
+  }
+
+  // CASE C: Supported purely by documents (no video match, or video not selected)
+  if (documentMatches.length > 0) {
+    const topDoc = documentMatches[0];
+    const docLabel = topDoc.chunk.type === 'slide' ? `Slide ${topDoc.chunk.pageOrSlideNumber}` : `Page ${topDoc.chunk.pageOrSlideNumber}`;
+    sources.push({
+      type: topDoc.doc.type,
+      title: topDoc.doc.title,
+      identifier: `${topDoc.doc.title} [${docLabel}]`,
+      pageNumber: topDoc.chunk.pageOrSlideNumber,
+      snippet: topDoc.chunk.content.substring(0, 160) + '...',
+    });
+
+    return {
+      answer: `Based on your uploaded course materials:\n\n` +
+        `📄 **Source: [${topDoc.doc.title} - ${docLabel}]**\n` +
+        `${topDoc.chunk.content}\n\n` +
+        `This explanation is strictly grounded in the retrieved document chunk.`,
+      evidenceGrounded: true,
+      insufficientEvidence: false,
+      futureContentBlocked: false,
+      sources,
+      eligibleTranscriptsCount: eligibleTranscripts.length,
+      totalTranscriptsCount: video ? video.transcripts.length : 0,
+    };
+  }
+
+  // CASE D: Neither video nor document contains sufficient evidence
+  return {
+    answer: `I could not find sufficient evidence in your available learning materials. Please refer to additional resources or review earlier course units. ` +
+      (video ? `(Playback timestamp analyzed: ${currentFormatted})` : ''),
+    evidenceGrounded: false,
+    insufficientEvidence: true,
+    futureContentBlocked: false,
+    sources: [],
+    eligibleTranscriptsCount: eligibleTranscripts.length,
+    totalTranscriptsCount: video ? video.transcripts.length : 0,
+  };
+}
