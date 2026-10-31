@@ -94,12 +94,35 @@ if (cachedCaptions) {
       generate_session_locally: true,
     });
 
+   
+    let tracks: any[] = [];
+
+const clients = ['ANDROID', 'WEB', 'IOS'];
+
+for (const client of clients) {
+  try {
+    console.log(`Trying YouTube client: ${client}`);
+
     const info: any = await youtube.getBasicInfo(videoId, {
-      client: 'ANDROID',
+      client: client as any,
     });
 
-    const tracks = info.captions?.caption_tracks ?? [];
+    tracks = info.captions?.caption_tracks ?? [];
 
+    console.log(
+      `Caption tracks from ${client}: ${tracks.length}`
+    );
+
+    if (tracks.length > 0) {
+      break;
+    }
+  } catch (error: any) {
+    console.warn(
+      `YouTube ${client} client failed:`,
+      error?.message || error
+    );
+  }
+}
     console.log(`YouTube caption tracks found: ${tracks.length}`);
 
     if (tracks.length === 0) {
