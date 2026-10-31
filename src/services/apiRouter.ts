@@ -52,8 +52,7 @@ function hashSessionToken(token: string): string {
 }
 
 function sessionCookie(token: string, maxAge = SESSION_MAX_AGE_SECONDS): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  return `learnova_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
+  return `learnova_session=${token}; HttpOnly; SameSite=None; Secure; Path=/; Max-Age=${maxAge}`;
 }
 
 async function hashPassword(password: string): Promise<string> {

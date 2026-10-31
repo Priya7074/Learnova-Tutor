@@ -1,13 +1,17 @@
+
 import { handleClientFallback } from './clientFallback.js';
+
+const API_BASE_URL = '';
 
 export async function apiCall<T = any>(method: string, path: string, body?: any): Promise<T> {
   let response: Response;
+
   try {
-    response = await fetch(path, {
+    response = await fetch(`${API_BASE_URL}${path}`, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: body ? JSON.stringify(body) : undefined,
-      credentials: 'same-origin',
+      credentials: 'include',
     });
   } catch {
     return handleFallback<T>(method, path, body);
@@ -17,12 +21,13 @@ export async function apiCall<T = any>(method: string, path: string, body?: any)
   try {
     data = await response.json();
   } catch {
-    // Vite/static preview has no API router and commonly returns its HTML shell.
     return handleFallback<T>(method, path, body);
   }
+
   if (!response.ok) {
     throw new Error(data?.error || `Request failed with status ${response.status}`);
   }
+
   return data as T;
 }
 
