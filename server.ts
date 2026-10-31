@@ -15,7 +15,7 @@ const server = http.createServer(async (req, res) => {
   const url = req.url || '/';
 
   // Security & CORS headers
- res.setHeader('Access-Control-Allow-Origin', 'https://harmonious-flan-f96963.netlify.app');
+ res.setHeader('Access-Control-Allow-Origin', 'https://sparkling-bombolone-d39b27.netlify.app');
 res.setHeader('Access-Control-Allow-Credentials', 'true');
 res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
 res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');  res.setHeader('X-Content-Type-Options', 'nosniff');
