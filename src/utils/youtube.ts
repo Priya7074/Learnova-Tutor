@@ -106,6 +106,7 @@ for (const client of clients) {
     const info: any = await youtube.getBasicInfo(videoId, {
       client: client as any,
     });
+    console.log('YouTube playability status:', info.playability_status);
 
     tracks = info.captions?.caption_tracks ?? [];
 
