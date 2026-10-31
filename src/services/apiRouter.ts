@@ -660,6 +660,8 @@ Provide an intuitive, clear, step-by-step response for the student with exact ci
 
       quiz = generateQuizFromDocument(doc, diff);
 
+   
+
     } else if (sourceType === 'video') {
       const video = serverVideos.find(v => v.id === sourceId);
 
@@ -668,7 +670,17 @@ Provide an intuitive, clear, step-by-step response for the student with exact ci
       }
 
       if (!geminiClient) {
-        return { status: 503, data: { error: 'AI quiz generation is not configured. Please check the Gemini API key.' } };
+        return {
+          status: 503,
+          data: { error: 'AI quiz generation is not configured. Please check the Gemini API key.' }
+        };
+      }
+
+      if (!video.youtubeUrl) {
+        return {
+          status: 400,
+          data: { error: 'A valid YouTube URL is required for quiz generation.' }
+        };
       }
 
       const requestedLimit = Number(maxTimestampSeconds);
@@ -676,84 +688,78 @@ Provide an intuitive, clear, step-by-step response for the student with exact ci
         ? Math.max(0, Math.min(Math.floor(requestedLimit), video.durationSeconds))
         : 0;
 
-      // Strict timestamp scope: future transcript segments are never sent to Gemini.
-      const eligibleTranscripts = video.transcripts.filter(
-        segment => segment.start <= timeLimit
-      );
-
-      if (eligibleTranscripts.length === 0) {
+      if (timeLimit <= 0) {
         return {
           status: 400,
-          data: { error: 'No transcript content is available before the selected timestamp. Move the video forward and try again.' }
+          data: { error: 'Please select a valid video timestamp.' }
         };
       }
-
-      const transcriptText = eligibleTranscripts.map(segment =>
-        `SEGMENT_ID: ${segment.id}\nTIMESTAMP: ${segment.timestampFormatted}\nTEXT: ${segment.text}`
-      ).join('\n\n');
 
       const prompt = `
 You are an educational quiz generator.
 
-Create 5 multiple-choice questions using ONLY the transcript provided below.
+Create up to 5 multiple-choice questions from this YouTube video.
 
 VIDEO TITLE: ${video.title}
 DIFFICULTY: ${diff}
-MAXIMUM ALLOWED TIMESTAMP: ${timeLimit} seconds
+STUDENT SELECTED TIMESTAMP: ${formatSecondsToTime(timeLimit)}
+MAXIMUM REQUESTED TIME: ${timeLimit} seconds
 
-STRICT RULES:
-1. Use only facts explicitly supported by the supplied transcript.
-2. Do not use outside knowledge or invent facts.
-3. Do not use information from after the maximum allowed timestamp.
-4. Match the requested difficulty: Easy, Medium, or Hard.
-5. Each question must have exactly four distinct answer options.
-6. Exactly one option must be correct.
-7. Questions must use the language of the transcript where practical.
-8. Every question must cite one supplied SEGMENT_ID as its evidence.
-9. If the transcript does not contain enough information, return fewer questions rather than inventing them.
+IMPORTANT:
+1. Focus only on material presented up to the selected timestamp.
+2. Do not intentionally use later video content.
+3. Do not invent facts or use unrelated outside knowledge.
+4. Create exactly four distinct options per question.
+5. Exactly one option must be correct.
+6. Include a brief explanation.
+7. Include the approximate video timestamp in seconds where the answer is supported.
+8. Return fewer questions if there is not enough reliable content.
+9. Return only valid JSON, without Markdown fences.
 
-Return ONLY valid JSON in this exact structure:
+JSON format:
 {
   "questions": [
     {
       "question": "Question text",
-      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "options": ["A", "B", "C", "D"],
       "correctIndex": 0,
-      "explanation": "Explanation supported by the transcript",
-      "sourceSegmentId": "EXACT_SEGMENT_ID"
+      "explanation": "Explanation",
+      "timestampSeconds": 60
     }
   ]
 }
-
-TRANSCRIPT:
-${transcriptText}
 `;
 
       try {
-        const response = await geminiClient.models.generateContent({
-          model: 'gemini-3.5-flash-lite',
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json'
-          }
+        const interaction = await geminiClient.interactions.create({
+          model: 'gemini-3.8-flash',
+          input: [
+            {
+              type: 'video',
+              uri: video.youtubeUrl
+            },
+            {
+              type: 'text',
+              text: prompt
+            }
+          ]
         });
 
-        const rawText = response.text || '';
-        const parsed = JSON.parse(rawText);
+        const rawText = interaction.output_text || '';
+        const cleanedText = rawText
+          .replace(/^```json\s*/i, '')
+          .replace(/^```\s*/i, '')
+          .replace(/\s*```$/, '')
+          .trim();
+
+        const parsed = JSON.parse(cleanedText);
         const generatedQuestions = Array.isArray(parsed.questions)
           ? parsed.questions
           : [];
 
-        const segmentMap = new Map(
-          eligibleTranscripts.map(segment => [segment.id, segment])
-        );
-
         const questions: QuizQuestion[] = generatedQuestions
           .filter((item: any) => {
-            const segment = segmentMap.get(item.sourceSegmentId);
-
             return (
-              segment &&
               typeof item.question === 'string' &&
               item.question.trim().length > 0 &&
               Array.isArray(item.options) &&
@@ -764,28 +770,29 @@ ${transcriptText}
               Number.isInteger(item.correctIndex) &&
               item.correctIndex >= 0 &&
               item.correctIndex < 4 &&
-              typeof item.explanation === 'string'
+              typeof item.explanation === 'string' &&
+              Number.isFinite(item.timestampSeconds) &&
+              item.timestampSeconds >= 0 &&
+              item.timestampSeconds <= timeLimit
             );
           })
           .slice(0, 5)
-          .map((item: any, index: number) => {
-            const segment = segmentMap.get(item.sourceSegmentId)!;
-
-            return {
-              id: `q_video_${index + 1}`,
-              question: item.question.trim(),
-              options: item.options.map((option: string) => option.trim()),
-              correctIndex: item.correctIndex,
-              explanation: item.explanation.trim(),
-              sourceReference: `Video [${segment.timestampFormatted}]`,
-              maxTimestampSeconds: segment.start
-            };
-          });
+          .map((item: any, index: number) => ({
+            id: `q_video_${index + 1}`,
+            question: item.question.trim(),
+            options: item.options.map((option: string) => option.trim()),
+            correctIndex: item.correctIndex,
+            explanation: item.explanation.trim(),
+            sourceReference: `Video [${formatSecondsToTime(item.timestampSeconds)}]`,
+            maxTimestampSeconds: Math.floor(item.timestampSeconds)
+          }));
 
         if (questions.length === 0) {
           return {
             status: 400,
-            data: { error: 'AI could not generate valid questions from the available transcript. Try selecting a later timestamp.' }
+            data: {
+              error: 'Gemini could not generate valid questions from this video and timestamp. Try another public YouTube video or a later timestamp.'
+            }
           };
         }
 
@@ -805,16 +812,21 @@ ${transcriptText}
         };
 
       } catch (error) {
-        console.error('AI video quiz generation failed:', error);
+        console.error('Gemini YouTube video quiz generation failed:', error);
 
         return {
           status: 502,
-          data: { error: 'AI quiz generation failed. Please try again.' }
+          data: {
+            error: 'YouTube video analysis failed. Check that the video is public and try again.'
+          }
         };
       }
-
+       
     } else {
-      return { status: 400, data: { error: 'Choose a supported quiz source.' } };
+      return {
+        status: 400,
+        data: { error: 'Choose a supported quiz source.' }
+      };
     }
 
     if (!quiz.questions.length) {
@@ -829,6 +841,7 @@ ${transcriptText}
 
     return { status: 200, data: { quiz } };
   }
+
   if (url === '/api/quizzes/submit' && method === 'POST') {
     const { quizId, attemptId, userAnswers } = body || {};
     if (typeof quizId !== 'string' || typeof attemptId !== 'string' || !/^[\w-]{8,100}$/.test(attemptId)) {
