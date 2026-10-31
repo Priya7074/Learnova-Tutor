@@ -308,17 +308,50 @@ export async function handleApiRequest(
     const descClean = sanitizeText(description, 1000);
 
     // Fetch actual YouTube captions/transcript
-    let videoTranscripts = Array.isArray(transcripts) && transcripts.length > 0 ? transcripts : null;
+    
+    // Fetch actual YouTube captions/transcript
     let captionsUnavailable = false;
 
+    // Use provided transcripts only if they contain real caption text.
+    // Ignore placeholder/fallback transcript messages.
+    let videoTranscripts =
+      Array.isArray(transcripts) &&
+      transcripts.some((t: any) =>
+        typeof t.text === 'string' &&
+        t.text.trim().length > 0 &&
+        !/does not have available captions|uploaded documents only|essential concepts for students/i.test(t.text)
+      )
+        ? transcripts
+        : null;
+
+    // If no real transcript was provided, fetch captions from YouTube.
     if (!videoTranscripts) {
-      const fetchedCaptions = await fetchYouTubeCaptions(youtubeId);
-      if (fetchedCaptions && fetchedCaptions.length > 0) {
-        videoTranscripts = fetchedCaptions;
-      } else {
+      console.log('Fetching actual YouTube captions:', youtubeId);
+
+      try {
+        const fetchedCaptions = await fetchYouTubeCaptions(youtubeId);
+
+        console.log(
+          'Fetched actual caption segments:',
+          fetchedCaptions?.length ?? 0
+        );
+
+        if (fetchedCaptions && fetchedCaptions.length > 0) {
+          videoTranscripts = fetchedCaptions;
+          console.log('Actual YouTube captions loaded successfully.');
+        } else {
+          captionsUnavailable = true;
+          console.warn('No usable YouTube captions found.');
+        }
+      } catch (error: any) {
         captionsUnavailable = true;
+        console.error(
+          'YouTube caption fetching failed:',
+          error?.message || error
+        );
       }
     }
+
 
     // Use provided transcripts or fallback to generic message if captions unavailable
     const finalTranscripts = videoTranscripts || [
@@ -429,17 +462,87 @@ export async function handleApiRequest(
     const { question, videoId, currentTimestampSeconds, documentIds } = body || {};
     const qClean = sanitizeText(question, 1000);
     if (!qClean) return { status: 400, data: { error: 'Question is required and cannot be empty.' } };
+    
+const video = serverVideos.find(v => v.id === videoId) || serverVideos[0];
 
-    const video = serverVideos.find(v => v.id === videoId) || serverVideos[0];
-    const timestamp = typeof currentTimestampSeconds === 'number' && !isNaN(currentTimestampSeconds)
-      ? Math.max(0, Math.floor(currentTimestampSeconds))
-      : 0;
-    const docs = Array.isArray(documentIds)
-      ? serverDocuments.filter(d => documentIds.includes(d.id))
-      : serverDocuments;
+const timestamp =
+  typeof currentTimestampSeconds === 'number' &&
+  !isNaN(currentTimestampSeconds)
+    ? Math.max(0, Math.floor(currentTimestampSeconds))
+    : 0;
 
-    // Execute core Chrono-Scoped evidence filter
-    const ragResult = performChronoScopedRag(qClean, video, timestamp, docs);
+const docs = Array.isArray(documentIds)
+  ? serverDocuments.filter(d => documentIds.includes(d.id))
+  : serverDocuments;
+
+// DEBUG: Check selected video and transcript availability
+console.log('========== AI TUTOR DEBUG ==========');
+console.log('Question:', qClean);
+console.log('Requested videoId:', videoId);
+console.log('Selected videoId:', video?.id);
+console.log('Selected video title:', video?.title);
+console.log('Total videos in memory:', serverVideos.length);
+console.log('Transcript segments available:', video?.transcripts?.length ?? 0);
+console.log('Current timestamp:', timestamp);
+console.log('Uploaded documents:', docs.length);
+
+const unlockedSegments = (video?.transcripts ?? []).filter(
+  segment => segment.start <= timestamp
+);
+
+console.log('Unlocked transcript segments:', unlockedSegments.length);
+console.log('First unlocked transcript samples:',
+  unlockedSegments.slice(0, 3).map(segment => ({
+    start: segment.start,
+    text: segment.text,
+  }))
+);
+
+// Execute core Chrono-Scoped evidence filter
+// Generate multilingual search variants.
+// The original question is always retained.
+let queryVariants: string[] = [];
+
+if (geminiClient) {
+  try {
+    const translationResponse = await geminiClient.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: `Convert the following student question into concise Hindi search terms.
+The source transcript may be in Hindi and may contain English technical terms.
+Preserve important technical terms such as primary key, database, machine learning,
+and programming terms in English where useful.
+Return ONLY the Hindi search query. Do not answer the question.
+
+Question: ${qClean}`,
+    });
+
+    const translatedQuery = translationResponse.text?.trim();
+
+    if (translatedQuery) {
+      queryVariants.push(translatedQuery);
+    }
+  } catch (error: any) {
+    console.warn(
+      'Multilingual query translation failed:',
+      error?.message || error
+    );
+  }
+}
+
+const ragResult = performChronoScopedRag(
+  qClean,
+  video,
+  timestamp,
+  docs,
+  queryVariants
+);
+
+console.log('RAG evidence grounded:', ragResult.evidenceGrounded);
+console.log('RAG future content blocked:', ragResult.futureContentBlocked);
+console.log('RAG sources count:', ragResult.sources?.length ?? 0);
+console.log('RAG source samples:', ragResult.sources?.slice(0, 3));
+console.log('========== END AI TUTOR DEBUG ==========');
+
 
     // Check cache to avoid repeated AI requests for identical question & timestamp
     const cacheKey = `${video.id}_${timestamp}_${qClean.toLowerCase()}`;

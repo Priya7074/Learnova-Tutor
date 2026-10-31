@@ -27,28 +27,58 @@ export function parseTimeToSeconds(timeStr: string): number {
   return 0;
 }
 
-function calculateTextSimilarity(query: string, text: string): number {
-  const queryTerms = query.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2);
-  const target = text.toLowerCase();
-  if (queryTerms.length === 0) return 0;
-  
-  let score = 0;
-  for (const term of queryTerms) {
-    if (target.includes(term)) {
-      score += 1;
-      // Bonus for exact word boundaries
-      const regex = new RegExp(`\\b${term}\\b`, 'i');
-      if (regex.test(target)) score += 1.5;
+function calculateTextSimilarity(
+  query: string,
+  text: string,
+  queryVariants: string[] = []
+): number {
+  const stopWords = new Set([
+    'the', 'is', 'are', 'was', 'were', 'what', 'which', 'when',
+    'where', 'why', 'how', 'does', 'did', 'do', 'can', 'could',
+    'would', 'should', 'explain', 'tell', 'about', 'this', 'that',
+    'for', 'and', 'with', 'from', 'into', 'you', 'your',
+    'hai', 'hain', 'kya', 'kaise', 'kyun', 'mein', 'me', 'ko',
+    'ka', 'ki', 'ke', 'se', 'aur', 'ye', 'woh', 'batao', 'samjhao'
+  ]);
+
+  const tokenize = (value: string): string[] =>
+    (value.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) || [])
+      .filter(word => !stopWords.has(word));
+
+  const targetWords = new Set(tokenize(text));
+  const variants = [query, ...queryVariants];
+
+  let bestScore = 0;
+
+  for (const variant of variants) {
+    const terms = [...new Set(tokenize(variant))];
+
+    if (terms.length === 0) continue;
+
+    let matched = 0;
+
+    for (const term of terms) {
+      if (targetWords.has(term)) {
+        matched++;
+      }
+    }
+
+    const score = matched / terms.length;
+
+    if (score > bestScore) {
+      bestScore = score;
     }
   }
-  return score / queryTerms.length;
+
+  return bestScore;
 }
 
 export function performChronoScopedRag(
   question: string,
   video?: VideoItem | null,
   currentTimestampSeconds: number = 0,
-  documents: DocumentItem[] = []
+  documents: DocumentItem[] = [],
+  queryVariants: string[] = []
 ): RagResult {
   const sources: SourceReference[] = [];
   const qClean = question.trim();
@@ -65,18 +95,28 @@ export function performChronoScopedRag(
   // 2. Score eligible transcripts
   const eligibleMatches: { transcript: TranscriptSegment; score: number }[] = [];
   for (const t of eligibleTranscripts) {
-    const score = calculateTextSimilarity(qClean, `${t.title || ''} ${t.text}`);
-    if (score > 0.15) {
+   const score = calculateTextSimilarity(
+  qClean,
+  `${t.title || ''} ${t.text}`,
+  queryVariants
+);
+    if (score > 0.3) {
       eligibleMatches.push({ transcript: t, score });
     }
   }
-  eligibleMatches.sort((a, b) => b.score - a.score);
+  // Sort by score first, then by timestamp (prefer later segments for same score to avoid always matching intro)
+  eligibleMatches.sort((a, b) => {
+    if (Math.abs(b.score - a.score) < 0.1) {
+      return b.transcript.start - a.transcript.start; // Prefer later segments
+    }
+    return b.score - a.score;
+  });
 
   // 3. Score future transcripts to identify if topic is coming up
   const futureMatches: { transcript: TranscriptSegment; score: number }[] = [];
   for (const t of futureTranscripts) {
     const score = calculateTextSimilarity(qClean, `${t.title || ''} ${t.text}`);
-    if (score > 0.25) {
+    if (score > 0.4) {
       futureMatches.push({ transcript: t, score });
     }
   }
@@ -86,7 +126,11 @@ export function performChronoScopedRag(
   const documentMatches: { doc: DocumentItem; chunk: DocumentChunk; score: number }[] = [];
   for (const doc of documents) {
     for (const chunk of doc.chunks) {
-      const score = calculateTextSimilarity(qClean, `${chunk.title || ''} ${chunk.content}`);
+     const score = calculateTextSimilarity(
+  qClean,
+  `${chunk.title || ''} ${chunk.content}`,
+  queryVariants
+);
       if (score > 0.18) {
         documentMatches.push({ doc, chunk, score });
       }
